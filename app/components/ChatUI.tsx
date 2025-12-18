@@ -1,19 +1,45 @@
-// app/components/ChatUI.tsx
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
 
-type HistoryItem = { id: string; role: "user" | "assistant" | "system"; content: string };
-type ToolPayload = { name?: string; arguments?: any; result?: any; status?: number };
+type HistoryItem = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+};
+
+type Financials = {
+  monthlyIncome?: number | null;
+  basicSalary?: number | null;
+  netSalary?: number | null;
+  housingAllowance?: number | null;
+  currentRent?: number | null;
+  uploaded?: boolean;
+};
 
 export default function ChatUI() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
-  const [history, setHistory] = useState<HistoryItem[]>([
-    { id: "s0", role: "system", content: "Hi — I'm AskRivo. How can I help with your mortgage today?" },
-  ]);
-  const [toolPayload, setToolPayload] = useState<ToolPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [conversationClosed, setConversationClosed] = useState(false);
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
+  
+  // FIX: Added currentStage state for Objective 4 Persistence
+  const [currentStage, setCurrentStage] = useState("DISCOVERY");
+
+  const [history, setHistory] = useState<HistoryItem[]>([
+    {
+      id: "sys-0",
+      role: "system",
+      content:
+        "Hi — I'm AskRivo. Upload your salary slip and I’ll help you decide whether renting or buying makes financial sense. All calculations are deterministic and privacy-safe.",
+    },
+  ]);
+
+  const [financials, setFinancials] = useState<Financials | null>(null);
+  const [toolPayload, setToolPayload] = useState<any | null>(null);
+
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -22,104 +48,164 @@ export default function ChatUI() {
   }, []);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    scrollRef.current?.scrollTo({
+      top: scrollRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [history]);
 
   function pushHistory(item: HistoryItem) {
     setHistory((h) => [...h, item]);
   }
 
+  async function handleFileUpload(file: File) {
+    try {
+      setError(null);
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const res = await fetch("/api/extract", {
+        method: "POST",
+        body: formData,
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json?.extractedData) {
+        throw new Error("Extraction failed");
+      }
+
+      setFinancials({
+        ...json.extractedData,
+        uploaded: true,
+      });
+
+      pushHistory({
+        id: `sys-extract-${Date.now()}`,
+        role: "system",
+        content:
+          "I’ve securely extracted and sanitized your financial details. You don’t need to type any numbers.",
+      });
+    } catch {
+      setError("Failed to extract document. Please try another file.");
+    }
+  }
+
   async function sendMessage() {
     const txt = message.trim();
-    if (!txt || loading) return;
+    if (!txt || loading || conversationClosed) return;
 
-    setError(null);
+    if (
+      awaitingConfirmation &&
+      ["yes", "ok", "proceed", "go ahead", "agree"].some((p) =>
+        txt.toLowerCase().includes(p)
+      )
+    ) {
+      setConversationClosed(true);
+      setAwaitingConfirmation(false);
+
+      pushHistory({
+        id: `sys-final-${Date.now()}`,
+        role: "system",
+        content:
+          "Great. I’ve captured your intent. A mortgage specialist will contact you shortly.",
+      });
+
+      setToolPayload((p: any) => ({
+        ...p,
+        finalStatus: "LEAD_CAPTURED",
+      }));
+
+      setMessage("");
+      return;
+    }
+
     setLoading(true);
-    setToolPayload(null);
+    setError(null);
 
-    const userItem: HistoryItem = { id: `u-${Date.now()}`, role: "user", content: txt };
-    pushHistory(userItem);
+    pushHistory({
+      id: `u-${Date.now()}`,
+      role: "user",
+      content: txt,
+    });
+
     setMessage("");
 
+    const rentMatch = txt.match(/(\d{3,6})/);
+    let updatedFinancials = financials ? { ...financials } : null;
+    if (rentMatch && updatedFinancials) {
+      updatedFinancials.currentRent = Number(rentMatch[1]);
+      setFinancials(updatedFinancials);
+    }
+
     try {
-      const res = await fetch("/api/ai", {
+      const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: txt }),
+        body: JSON.stringify({
+          messages: history
+            .filter((h) => h.role !== "system")
+            .map((h) => ({ role: h.role, content: h.content })),
+          currentUserMessage: txt,
+          stage: currentStage,
+          data: { financials: updatedFinancials },
+        }),
       });
 
-      if (!res.ok) {
-        const bodyText = await res.text().catch(() => null);
-        const errMsg = `Server ${res.status}: ${bodyText ?? res.statusText}`;
-        pushHistory({ id: `err-${Date.now()}`, role: "assistant", content: `Error: ${errMsg}` });
-        setError(errMsg);
-        setLoading(false);
-        return;
+      const json = await res.json();
+
+      if (!res.ok || json?.type === "ERROR") {
+        throw new Error(json?.message || "Request failed");
       }
 
-      const json = await res.json().catch((e) => {
-        const errMsg = `Invalid JSON from server: ${String(e)}`;
-        pushHistory({ id: `err-json-${Date.now()}`, role: "assistant", content: `Error: ${errMsg}` });
-        setError(errMsg);
-        setLoading(false);
-        return null;
-      });
-
-      if (!json) return;
-
-      if (json.ok === false) {
-        const err = json.error ?? "Unknown error";
-        pushHistory({ id: `aerr-${Date.now()}`, role: "assistant", content: `Error: ${err}` });
-        setError(err);
-        setLoading(false);
-        return;
+      // FIX: Update currentStage based on server response for sticky closing
+      if (json?.stage) {
+        setCurrentStage(json.stage);
       }
 
-      // Main assistant response
-      if (typeof json.modelResponse === "string" && json.modelResponse.trim()) {
-        pushHistory({ id: `a-${Date.now()}`, role: "assistant", content: json.modelResponse });
-      } //
-      else if (json.tool && json.tool.result) {
-        const r = json.tool.result;
-
-        const warningsText = r.warnings?.length
-          ? `Warnings: ${r.warnings.join("; ")}`
-          : "";
-
-        const summary = [
-          "Numbers computed by the calculator tool.",
-          `Loan Amount: ${r.loanAmount ?? "N/A"}`,
-          `Monthly EMI: ${r.monthlyEMI ?? "N/A"}`,
-          `Upfront Costs: ${r.hiddenFees ?? "N/A"}`,
-          warningsText,
-        ]
-          .filter(Boolean)
-          .join("  |  ");
-
-        pushHistory({
-          id: `a-tool-${Date.now()}`,
-          role: "assistant",
-          content: summary,
-        });
-      } //
-      else {
+      if (json?.type === "QUESTION") {
         pushHistory({
           id: `a-${Date.now()}`,
           role: "assistant",
-          content: "No response from model. Check tool output.",
+          content: json.message,
         });
       }
 
-      // Store tool payload for the right-hand evidence panel
-      if (json.tool) {
-        setToolPayload(json.tool);
-      } else {
-        setToolPayload(null);
+      if (json?.type === "RESULT") {
+        setToolPayload({
+          decision: json.decision,
+          metrics: json.metrics,
+          nextAction: null,
+        });
+
+        pushHistory({
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: json.explanation,
+        });
+      }
+
+      if (json?.type === "CLOSE") {
+        setAwaitingConfirmation(true);
+
+        setToolPayload({
+          decision: json.decision,
+          metrics: json.metrics,
+          nextAction: json.nextAction,
+        });
+
+        pushHistory({
+          id: `a-${Date.now()}`,
+          role: "assistant",
+          content: json.message,
+        });
       }
     } catch (e: any) {
-      const m = String(e?.message ?? e);
-      pushHistory({ id: `aerr-${Date.now()}`, role: "assistant", content: `Network error: ${m}` });
-      setError(m);
+      pushHistory({
+        id: `err-${Date.now()}`,
+        role: "assistant",
+        content: `Error: ${String(e?.message ?? e)}`,
+      });
     } finally {
       setLoading(false);
       setTimeout(() => inputRef.current?.focus(), 50);
@@ -127,28 +213,9 @@ export default function ChatUI() {
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter") {
       e.preventDefault();
       sendMessage();
-    }
-  }
-
-  function downloadJSON() {
-    if (!toolPayload) return;
-    const blob = new Blob([JSON.stringify(toolPayload, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "tool-evidence.json";
-    a.click();
-  }
-
-  async function copyJSON() {
-    if (!toolPayload) return;
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(toolPayload, null, 2));
-      window.alert("Tool JSON copied to clipboard.");
-    } catch (e) {
-      window.alert("Copy failed: " + String(e));
     }
   }
 
@@ -156,80 +223,85 @@ export default function ChatUI() {
     <div className="content" style={{ alignItems: "flex-start" }}>
       <div className="left">
         <div className="card instructions">
-          <h3>AskRivo — Mortgage Anti-Calculator</h3>
-          <p className="hint">Ask anything — I’ll interpret it naturally, and calculate using the math tool.</p>
-          <p className="hint">All numbers come from a deterministic calculator, not the AI.</p>
+          <h3>AskRivo — Mortgage Advisor</h3>
+          <p className="hint">
+            Upload your salary slip. All calculations are deterministic and
+            privacy-safe.
+          </p>
         </div>
 
-        <div className="card chat" style={{ display: "flex", flexDirection: "column" }}>
-          <div ref={scrollRef} className="chat-history" style={{ paddingRight: 8 }}>
+        <div className="card chat">
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              padding: "10px 12px",
+              borderRadius: 10,
+              background: "rgba(255,255,255,0.04)",
+              border: "1px dashed rgba(255,255,255,0.15)",
+              marginBottom: 14,
+            }}
+          >
+            <label style={{ cursor: "pointer", fontSize: 13, color: "#cbd5e1" }}>
+              📄 Upload salary slip
+              <input
+                type="file"
+                accept=".pdf,.png,.jpg,.jpeg"
+                style={{ display: "none" }}
+                onChange={(e) =>
+                  e.target.files && handleFileUpload(e.target.files[0])
+                }
+              />
+            </label>
+            <span style={{ fontSize: 12, color: "#94a3b8" }}>
+              PDF / Image · Secure OCR
+            </span>
+          </div>
+
+          <div ref={scrollRef} className="chat-history">
             {history.map((h) => (
               <div key={h.id} className="msg-pair">
                 <div className={`bubble ${h.role}`}>{h.content}</div>
               </div>
             ))}
-            {loading && <div className="loading">Thinking…</div>}
+            {loading && <div className="loading">Analyzing…</div>}
           </div>
 
-          <div className="composer" style={{ marginTop: 8 }}>
+          <div className="chat-input-row">
             <input
               ref={inputRef}
-              className="composer-input"
-              placeholder='Try: "EMI for 2,000,000 AED with 20% down in 25 years"'
+              className="chat-input"
+              placeholder={
+                conversationClosed
+                  ? "Conversation completed"
+                  : "Ask about rent vs buy or affordability"
+              }
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={loading}
-              style={{
-                width: "100%",
-                padding: 10,
-                borderRadius: 8,
-                border: "1px solid var(--border)",
-                background: "var(--glass)",
-                color: "var(--muted)",
-              }}
+              disabled={loading || conversationClosed}
             />
-
-            <div className="controls" style={{ marginTop: 8 }}>
-              <button className="btn" onClick={sendMessage} disabled={loading}>
-                {loading ? "Thinking..." : "Send"}
-              </button>
-
-              <button
-                className="btn ghost"
-                onClick={() => {
-                  setMessage("");
-                  inputRef.current?.focus();
-                }}
-                disabled={loading}
-              >
-                Clear
-              </button>
-
-              {error && <div className="error" style={{ marginLeft: 12 }}>{error}</div>}
-            </div>
+            <button
+              className="chat-btn send"
+              onClick={sendMessage}
+              disabled={loading || conversationClosed}
+            >
+              Ask
+            </button>
           </div>
+
+          {error && <div className="error">{error}</div>}
         </div>
       </div>
 
       <div className="right">
         <div className="card raw-card">
-          <h4>Tool JSON (authoritative calculator output)</h4>
-
-          <div className="raw-actions">
-            <button className="btn small" onClick={downloadJSON} disabled={!toolPayload}>
-              Download JSON
-            </button>
-            <button className="btn small ghost" onClick={copyJSON} disabled={!toolPayload}>
-              Copy JSON
-            </button>
-            <button className="btn small ghost" onClick={() => setToolPayload(null)}>
-              Clear
-            </button>
-          </div>
-
-          <pre className="raw-box" style={{ marginTop: 8 }}>
-            {toolPayload ? JSON.stringify(toolPayload, null, 2) : "No tool result yet."}
+          <h4>Tool JSON (authoritative)</h4>
+          <pre className="raw-box">
+            {toolPayload
+              ? JSON.stringify(toolPayload, null, 2)
+              : "No tool result yet."}
           </pre>
         </div>
       </div>
